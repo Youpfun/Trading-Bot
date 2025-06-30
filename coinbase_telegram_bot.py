@@ -40,11 +40,18 @@ class CoinbaseTelegramBot:
             logging.error("TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquants dans .env")
             raise ValueError("Configuration Telegram manquante")
         
-        # Configuration du bot
+        # Configuration du bot avec nettoyage des commentaires
         self.trading_mode = os.getenv("TRADING_MODE", "SIMULATION")
-        self.prediction_threshold = float(os.getenv("PREDICTION_THRESHOLD", "0.00002"))
-        self.volume_growth_factor = float(os.getenv("VOLUME_GROWTH_FACTOR", "2"))
-        self.price_surge_percentage = float(os.getenv("PRICE_SURGE_PERCENTAGE", "0.01"))
+        
+        # Nettoyage des valeurs pour éviter les commentaires
+        prediction_threshold_str = os.getenv("PREDICTION_THRESHOLD", "0.00002")
+        self.prediction_threshold = float(prediction_threshold_str.split('#')[0].strip())
+        
+        volume_growth_factor_str = os.getenv("VOLUME_GROWTH_FACTOR", "2")
+        self.volume_growth_factor = float(volume_growth_factor_str.split('#')[0].strip())
+        
+        price_surge_percentage_str = os.getenv("PRICE_SURGE_PERCENTAGE", "0.01")
+        self.price_surge_percentage = float(price_surge_percentage_str.split('#')[0].strip())
         
         # Instruments à analyser - LISTE ÉTENDUE
         self.instruments = [
@@ -538,13 +545,17 @@ class CoinbaseTelegramBot:
     def send_detailed_trading_alert(self, product_id, price, data, signals):
         """Envoie une alerte de trading détaillée via Telegram"""
         try:
-            # Éviter le spam - max 1 alerte par instrument toutes les 5 minutes
+            # Éviter le spam - MODIFIÉ: Réduire à 2 minutes pour débugger
             now = time.time()
             if product_id in self.last_alerts:
-                if now - self.last_alerts[product_id] < 300:  # 5 minutes
+                if now - self.last_alerts[product_id] < 120:  # 2 minutes au lieu de 5
+                    logging.info(f"⏰ Alerte {product_id} bloquée par anti-spam (dernière: {(now - self.last_alerts[product_id])/60:.1f}min)")
                     return
             
             self.last_alerts[product_id] = now
+            
+            # DEBUG: Log pour vérifier qu'on arrive ici
+            logging.info(f"🔔 Préparation alerte pour {product_id} - Prix: ${price:.4f}")
             
             # Analyser les signaux pour déterminer l'action principale
             buy_signals = 0
@@ -573,12 +584,22 @@ class CoinbaseTelegramBot:
                 main_action = "🔴 VENDRE"
                 action_strength = sell_signals
 
+            # DEBUG: Log pour voir l'action déterminée
+            logging.info(f"🎯 Action déterminée pour {product_id}: {main_action} (Force: {action_strength})")
+            logging.info(f"📊 Signaux - Achat: {buy_signals}, Vente: {sell_signals}, RSI: {rsi_value:.1f}")
+
+            # FILTRE: N'envoyer que les alertes d'ACHAT
+            if main_action != "🟢 ACHETER":
+                logging.info(f"Signal {main_action} ignoré pour {product_id} - Seuls les achats sont notifiés")
+                return
+
+            # DEBUG: Log pour confirmer qu'on va envoyer l'alerte
+            logging.info(f"✅ Envoi alerte d'ACHAT pour {product_id}")
+
             # NOUVEAU: Gérer le suivi des trades
             trade_closed = None
             if main_action == "🟢 ACHETER":
                 self.track_buy_signal(product_id, price, signals)
-            elif main_action == "🔴 VENDRE":
-                trade_closed = self.track_sell_signal(product_id, price)
             
             # NOUVEAU: Générer le lien Coinbase
             crypto_symbol = product_id.replace('-USD', '').lower()
@@ -592,222 +613,48 @@ class CoinbaseTelegramBot:
             message += f"📊 <a href='{coinbase_link}'>Voir le graphique Coinbase</a>\n"
             message += f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
             
-            # NOUVEAU: Afficher les informations de trade si position fermée
-            if trade_closed:
-                profit_emoji = "💚" if trade_closed['profit_usd'] > 0 else "❌"
-                gain_pct = trade_closed['profit_pct']
-                message += f"\n{profit_emoji} <b>TRADE FERMÉ</b>\n"
-                message += f"📈 Prix d'achat: ${trade_closed['entry_price']:.4f}\n"
-                message += f"📉 Prix de vente: ${trade_closed['exit_price']:.4f}\n"
-                message += f"💰 Profit: <b>${trade_closed['profit_usd']:.2f}</b> ({gain_pct:+.2f}%)\n"
-                message += f"⏱️ Durée: {str(trade_closed['duration']).split('.')[0]}\n"
+            # NOUVEAU: Calcul et affichage des frais Crypto.com
+            message += f"\n💳 <b>FRAIS CRYPTO.COM (0.4% par transaction):</b>\n"
             
-            message += f"\n🎯 <b>RECOMMANDATION: {main_action}</b>\n"
+            # Calcul pour différents montants
+            amounts = [100, 500, 1000]
+            for amount in amounts:
+                fees_data = self.calculate_crypto_com_fees(amount)
+                if fees_data:
+                    message += f"💶 <b>{amount}€:</b>\n"
+                    message += f"   📈 Frais achat: {fees_data['buy_fee']:.2f}€\n"
+                    message += f"   📉 Frais vente: {fees_data['sell_fee']:.2f}€\n"
+                    message += f"   💸 Total frais: <b>{fees_data['total_fees']:.2f}€</b>\n"
+                    message += f"   💰 Net après achat: {fees_data['net_after_buy']:.2f}€\n"
+                    message += f"   🔄 Net après A/R: {fees_data['net_after_roundtrip']:.2f}€\n\n"
+        
+            # Reste du message (simplifié pour débugger)
+            message += f"🎯 <b>RECOMMANDATION: {main_action}</b>\n"
             if action_strength > 0:
                 message += f"💪 Force du signal: {action_strength} indicateur(s)\n"
             message += f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             
-            # Détails des signaux
-            message += f"📊 <b>ANALYSE DÉTAILLÉE:</b>\n\n"
-            
-            for signal in signals:
-                if signal['type'] == 'PREDICTION':
-                    emoji = "📈" if signal['direction'] == 'BUY' else "📉"
-                    action_text = "➡️ <b>ACHETER MAINTENANT</b>" if signal['direction'] == 'BUY' else "➡️ <b>VENDRE MAINTENANT</b>"
-                    message += f"{emoji} <b>PRÉDICTION IA</b>\n"
-                    message += f"{action_text}\n"
-                    message += f"🎯 Confiance: <b>{signal['confidence']:.1f}%</b>\n"
-                    message += f"📊 Score: {signal['prediction']:.6f}\n\n"
-                    
-                elif signal['type'] == 'VOLUME':
-                    message += f"🔥 <b>VOLUME EXCEPTIONNEL</b>\n"
-                    message += f"📈 Volume actuel: {signal['ratio']:.2f}x la moyenne\n"
-                    message += f"💡 Forte activité - Mouvement imminent\n\n"
-                    
-                elif signal['type'] == 'RSI':
-                    if signal['direction'] == 'OVERSOLD':
-                        message += f"💎 <b>RSI - SURVENTE</b>\n"
-                        message += f"➡️ <b>OPPORTUNITÉ D'ACHAT</b>\n"
-                        message += f"📊 RSI: {signal['value']:.1f} (< 30)\n"
-                        message += f"💡 Prix potentiellement au plus bas\n\n"
-                    else:
-                        message += f"⚠️ <b>RSI - SURACHAT</b>\n"
-                        message += f"➡️ <b>ENVISAGER LA VENTE</b>\n"
-                        message += f"📊 RSI: {signal['value']:.1f} (> 70)\n"
-                        message += f"💡 Prix potentiellement au plus haut\n\n"
-                        
-                elif signal['type'] == 'BB':
-                    if signal['direction'] == 'NEAR_LOWER_BAND':
-                        message += f"📉 <b>BOLLINGER - BANDE BASSE</b>\n"
-                        message += f"➡️ <b>ZONE D'ACHAT</b>\n"
-                        message += f"📊 Position: {signal['value']:.2f}\n"
-                        message += f"💡 Prix proche du support\n\n"
-                    else:
-                        message += f"📈 <b>BOLLINGER - BANDE HAUTE</b>\n"
-                        message += f"➡️ <b>ZONE DE VENTE</b>\n"
-                        message += f"📊 Position: {signal['value']:.2f}\n"
-                        message += f"💡 Prix proche de la résistance\n\n"
-                        
-                elif signal['type'] == 'MACD':
-                    if signal['direction'] == 'BULLISH_CROSSOVER':
-                        message += f"🚀 <b>MACD - SIGNAL HAUSSIER</b>\n"
-                        message += f"➡️ <b>SIGNAL D'ACHAT</b>\n"
-                        message += f"💡 Momentum positif confirmé\n\n"
-                    else:
-                        message += f"📉 <b>MACD - SIGNAL BAISSIER</b>\n"
-                        message += f"➡️ <b>SIGNAL DE VENTE</b>\n"
-                        message += f"💡 Momentum négatif confirmé\n\n"
-            
-            # Informations de contexte
-            message += f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            # Informations de base
             message += f"📋 <b>CONTEXTE MARCHÉ:</b>\n"
             message += f"📊 RSI: {data['rsi']:.1f}\n"
             message += f"💹 Volume: {data['volume_ratio']:.2f}x moyenne\n"
             message += f"📈 MA20: ${data['ma_20']:.4f}\n"
             message += f"📊 Volatilité: {data['volatility']:.4f}\n\n"
             
-            # NOUVEAU: Instructions détaillées avec prix précis ET POURCENTAGES
-            if main_action == "🟢 ACHETER":
-                volatility = data['volatility']
-                
-                if volatility > 0.05:
-                    quick_profit = price * 1.03
-                    medium_profit = price * 1.08
-                    high_profit = price * 1.15
-                    stop_loss = price * 0.94
-                    quick_pct = 3.0
-                    medium_pct = 8.0
-                    high_pct = 15.0
-                    stop_pct = -6.0
-                elif volatility > 0.02:
-                    quick_profit = price * 1.02
-                    medium_profit = price * 1.05
-                    high_profit = price * 1.10
-                    stop_loss = price * 0.95
-                    quick_pct = 2.0
-                    medium_pct = 5.0
-                    high_pct = 10.0
-                    stop_pct = -5.0
-                else:
-                    quick_profit = price * 1.015
-                    medium_profit = price * 1.03
-                    high_profit = price * 1.06
-                    stop_loss = price * 0.97
-                    quick_pct = 1.5
-                    medium_pct = 3.0
-                    high_pct = 6.0
-                    stop_pct = -3.0
-                
-                message += f"💰 <b>PLAN D'ACHAT DÉTAILLÉ:</b>\n"
-                message += f"🛒 <b>Prix d'achat:</b> ${price:.4f}\n\n"
-                
-                message += f"🎯 <b>OBJECTIFS DE VENTE:</b>\n"
-                message += f"🥉 <b>Profit Rapide (25%):</b> ${quick_profit:.4f} (+{quick_pct:.1f}%)\n"
-                message += f"   ↳ Vendre 25% à ce prix\n"
-                message += f"🥈 <b>Profit Moyen (50%):</b> ${medium_profit:.4f} (+{medium_pct:.1f}%)\n"
-                message += f"   ↳ Vendre 50% à ce prix\n"
-                message += f"🥇 <b>Profit Maximum (25%):</b> ${high_profit:.4f} (+{high_pct:.1f}%)\n"
-                message += f"   ↳ Vendre le reste à ce prix\n\n"
-                
-                message += f"🛑 <b>STOP-LOSS:</b> ${stop_loss:.4f} ({stop_pct:.1f}%)\n"
-                message += f"   ↳ Vendre TOUT si le prix descend\n\n"
-                
-                # NOUVEAU: Calcul du gain potentiel total
-                total_gain_conservative = (quick_profit * 0.25 + medium_profit * 0.50 + high_profit * 0.25) - price
-                total_gain_pct = (total_gain_conservative / price) * 100
-                
-                message += f"💹 <b>GAIN POTENTIEL TOTAL:</b> +{total_gain_pct:.2f}%\n"
-                message += f"💸 <b>Profit estimé:</b> ${total_gain_conservative:.2f} par unité\n\n"
-                
-                message += f"📋 <b>ÉTAPES À SUIVRE:</b>\n"
-                message += f"1️⃣ Acheter maintenant à ~${price:.4f}\n"
-                message += f"2️⃣ Placer ordre de vente à ${quick_profit:.4f} (+{quick_pct:.1f}%)\n"
-                message += f"3️⃣ Placer stop-loss à ${stop_loss:.4f} ({stop_pct:.1f}%)\n"
-                message += f"4️⃣ Surveiller pour les autres niveaux\n"
-                
-            elif main_action == "🔴 VENDRE":
-                volatility = data['volatility']
-                
-                if volatility > 0.05:
-                    buyback_1 = price * 0.92
-                    buyback_2 = price * 0.85
-                    stop_loss = price * 1.06
-                    buyback_pct_1 = -8.0
-                    buyback_pct_2 = -15.0
-                    stop_pct = +6.0
-                elif volatility > 0.02:
-                    buyback_1 = price * 0.95
-                    buyback_2 = price * 0.90
-                    stop_loss = price * 1.05
-                    buyback_pct_1 = -5.0
-                    buyback_pct_2 = -10.0
-                    stop_pct = +5.0
-                else:
-                    buyback_1 = price * 0.97
-                    buyback_2 = price * 0.94
-                    stop_loss = price * 1.03
-                    buyback_pct_1 = -3.0
-                    buyback_pct_2 = -6.0
-                    stop_pct = +3.0
-                
-                message += f"💸 <b>PLAN DE VENTE DÉTAILLÉ:</b>\n"
-                message += f"💰 <b>Prix de vente:</b> ${price:.4f}\n\n"
-                
-                message += f"🔄 <b>OBJECTIFS DE RACHAT:</b>\n"
-                message += f"🛒 <b>Premier rachat (50%):</b> ${buyback_1:.4f} ({buyback_pct_1:.1f}%)\n"
-                message += f"   ↳ Racheter 50% si correction\n"
-                message += f"🛒 <b>Rachat massif (100%):</b> ${buyback_2:.4f} ({buyback_pct_2:.1f}%)\n"
-                message += f"   ↳ Racheter massivement\n\n"
-                
-                message += f"🛑 <b>STOP-LOSS (au cas où):</b> ${stop_loss:.4f} (+{stop_pct:.1f}%)\n"
-                message += f"   ↳ Racheter si le prix remonte\n\n"
-                
-                # NOUVEAU: Calcul du gain potentiel de la vente
-                potential_gain = (buyback_1 * 0.5 + buyback_2 * 0.5) - price
-                potential_gain_pct = (potential_gain / price) * 100
-                
-                message += f"💹 <b>GAIN POTENTIEL VENTE:</b> {potential_gain_pct:.2f}%\n"
-                message += f"💸 <b>Profit estimé:</b> ${abs(potential_gain):.2f} par unité\n\n"
-                
-                message += f"📋 <b>ÉTAPES À SUIVRE:</b>\n"
-                message += f"1️⃣ Vendre maintenant à ~${price:.4f}\n"
-                message += f"2️⃣ Attendre correction à ${buyback_1:.4f} ({buyback_pct_1:.1f}%)\n"
-                message += f"3️⃣ Surveiller ${buyback_2:.4f} ({buyback_pct_2:.1f}%) pour gros rachat\n"
-                message += f"4️⃣ Stop-loss à ${stop_loss:.4f} (+{stop_pct:.1f}%) si remontée\n"
-                
-            else:
-                message += f"⏳ <b>AUCUNE ACTION RECOMMANDÉE</b>\n"
-                message += f"💡 Attendre des signaux plus clairs\n"
-                resistance = price * 1.05
-                support = price * 0.95
-                resistance_pct = 5.0
-                support_pct = -5.0
-                message += f"\n🔍 <b>NIVEAUX À SURVEILLER:</b>\n"
-                message += f"📈 Résistance: ${resistance:.4f} (+{resistance_pct:.1f}%)\n"
-                message += f"📉 Support: ${support:.4f} ({support_pct:.1f}%)\n"
-            
-            # NOUVEAU: Afficher les statistiques de performance
-            stats = self.get_performance_stats()
-            if stats:
-                message += f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                message += f"📊 <b>PERFORMANCE BOT:</b>\n"
-                message += f"💰 Profit Total: <b>${stats['total_profit']:.2f}</b>\n"
-                message += f"📈 Trades: {stats['total_trades']} | Win: {stats['win_trades']} | Loss: {stats['loss_trades']}\n"
-                message += f"🎯 Taux de réussite: <b>{stats['win_rate']:.1f}%</b>\n"
-                message += f"📋 Positions actives: {stats['active_positions']}\n"
-                
-                if stats['best_trade']:
-                    best_pct = stats['best_trade']['profit_pct']
-                    message += f"🥇 Meilleur trade: ${stats['best_trade']['profit_usd']:.2f} (+{best_pct:.2f}%) - {stats['best_trade']['product_id']}\n"
-            
-            message += f"\n🤖 Mode: {self.trading_mode}"
+            message += f"🤖 Mode: {self.trading_mode}"
             message += f"\n⚠️ Ceci n'est pas un conseil financier"
             
+            # DEBUG: Log avant envoi
+            logging.info(f"📤 Envoi du message Telegram pour {product_id}")
+            
             self.send_message(message)
-            logging.info(f"Alerte détaillée envoyée pour {product_id}: {len(signals)} signaux - Action: {main_action}")
+            logging.info(f"✅ Alerte d'ACHAT envoyée pour {product_id}: {len(signals)} signaux - Action: {main_action}")
             
         except Exception as e:
-            logging.error(f"Erreur envoi alerte détaillée {product_id}: {e}")
+            logging.error(f"❌ Erreur envoi alerte détaillée {product_id}: {e}")
+            # DEBUG: Afficher la stack trace complète
+            import traceback
+            logging.error(f"Stack trace: {traceback.format_exc()}")
 
     def send_daily_performance_report(self):
         """Envoie un rapport de performance quotidien"""
@@ -913,6 +760,7 @@ class CoinbaseTelegramBot:
             schedule.every().hour.do(self.run_analysis_cycle)
             schedule.every(4).hours.do(self.send_status_message)
             schedule.every().day.at("08:00").do(self.send_daily_performance_report)  # NOUVEAU: Rapport quotidien
+            schedule.every().day.at("09:00").do(self.send_fees_summary)  # Résumé quotidien des frais
             
             # Message de confirmation
             self.send_message("✅ <b>BOT OPÉRATIONNEL</b>\n📊 Analyses programmées toutes les heures\n📱 Vous recevrez les alertes dans ce canal\n💰 Suivi des profits activé")
@@ -931,6 +779,77 @@ class CoinbaseTelegramBot:
         except Exception as e:
             logging.error(f"Erreur critique: {e}")
             self.send_message(f"❌ Erreur critique: {e}")
+
+    def calculate_crypto_com_fees(self, amount_eur):
+        """
+        Calcule les frais de transaction Crypto.com pour différents montants
+        Frais Crypto.com : 0.4% par transaction (maker/taker)
+        """
+        try:
+            # Frais de base Crypto.com (0.4% par transaction)
+            base_fee_rate = 0.004
+            
+            # Frais pour achat
+            buy_fee = amount_eur * base_fee_rate
+            
+            # Frais pour vente (même taux)
+            sell_fee = amount_eur * base_fee_rate
+            
+            # Frais total (achat + vente)
+            total_fees = buy_fee + sell_fee
+            
+            # Montant net après frais d'achat
+            net_amount_after_buy = amount_eur - buy_fee
+            
+            # Montant net après vente complète (roundtrip)
+            net_amount_after_roundtrip = amount_eur - total_fees
+            
+            return {
+                'amount_eur': amount_eur,
+                'buy_fee': buy_fee,
+                'sell_fee': sell_fee,
+                'total_fees': total_fees,
+                'net_after_buy': net_amount_after_buy,
+                'net_after_roundtrip': net_amount_after_roundtrip,
+                'fee_percentage': base_fee_rate * 100
+            }
+            
+        except Exception as e:
+            logging.error(f"Erreur calcul frais Crypto.com: {e}")
+            return None
+
+    def send_fees_summary(self):
+        """Envoie un résumé des frais Crypto.com"""
+        try:
+            message = f"💳 <b>FRAIS CRYPTO.COM - RÉSUMÉ</b>\n"
+            message += f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            
+            message += f"📊 <b>TAUX DE FRAIS:</b>\n"
+            message += f"• Maker: <b>0.40%</b>\n"
+            message += f"• Taker: <b>0.40%</b>\n"
+            message += f"• Retrait: Variable selon crypto\n\n"
+            
+            message += f"💰 <b>CALCUL DES FRAIS:</b>\n"
+            
+            amounts = [100, 500, 1000, 2000, 5000]
+            for amount in amounts:
+                fees_data = self.calculate_crypto_com_fees(amount)
+                if fees_data:
+                    message += f"💶 <b>{amount}€:</b>\n"
+                    message += f"   📈 Achat: {fees_data['buy_fee']:.2f}€\n"
+                    message += f"   📉 Vente: {fees_data['sell_fee']:.2f}€\n"
+                    message += f"   🔄 Total A/R: <b>{fees_data['total_fees']:.2f}€</b>\n\n"
+            
+            message += f"💡 <b>CONSEILS:</b>\n"
+            message += f"• Minimum 2% de gain pour couvrir les frais\n"
+            message += f"• Éviter les trades très courts\n"
+            message += f"• Considérer les frais dans vos calculs\n"
+            message += f"• Utiliser les ordres maker si possible\n"
+            
+            self.send_message(message)
+            
+        except Exception as e:
+            logging.error(f"Erreur envoi résumé frais: {e}")
 
 def main():
     try:
